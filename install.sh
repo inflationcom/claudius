@@ -17,9 +17,13 @@ dest="$dest_dir/claudius"
 mkdir -p "$dest_dir"
 
 # Use the script sitting next to this installer if present (local clone),
-# otherwise download it (curl | bash).
-src_local="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/claudius"
-if [[ -f "$src_local" ]]; then
+# otherwise download it (curl | bash, where the installer has no file on disk).
+self="${BASH_SOURCE[0]:-}"
+src_local=""
+if [[ -n "$self" && -f "$self" ]]; then
+  src_local="$(cd "$(dirname "$self")" && pwd)/claudius"
+fi
+if [[ -n "$src_local" && -f "$src_local" ]]; then
   cp "$src_local" "$dest"
   echo "installed: $dest  (from local clone)"
 else
