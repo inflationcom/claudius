@@ -12,7 +12,7 @@ class Claudius < Formula
   desc "Launcher and session manager for Claude Code"
   homepage "https://github.com/inflationcom/claudius"
   url "https://github.com/inflationcom/claudius/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "REPLACE_WITH_TARBALL_SHA256"
+  sha256 "412930f97b2adc61df777564bddb57868dfd461e99bc39ebd74178d6d68cccbb"
   license "MIT"
 
   depends_on "jq"
