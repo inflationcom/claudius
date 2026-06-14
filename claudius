@@ -1,0 +1,1105 @@
+#!/usr/bin/env bash
+#
+# claudius — a launcher and session manager for Claude Code
+#
+# Switch between your Claude accounts, browse and resume sessions per project,
+# and keep an eye on your usage limits. Claude Code runs unchanged underneath;
+# claudius only sets which credentials it uses and helps you find the right chat.
+#
+#   Homepage : https://github.com/USER/claudius   (replace USER)
+#   License  : MIT
+#   Requires : claude (Claude Code), jq        Optional: curl (usage), ttyd (serve)
+#   Platforms: macOS, Linux. On Windows use WSL.
+#
+# Usage:
+#   claudius            launch the interactive UI
+#   claudius clip       jot down a prompt draft for the current project
+#   claudius serve      expose the UI as a web terminal (for phone/remote access)
+#   claudius --help     show help
+#
+# Notes:
+#   - Backup-account tokens are stored in the OS secret store (macOS Keychain or
+#     libsecret/secret-tool), falling back to a 0600 file if neither is present.
+#   - Usage figures come from Claude's account API. These endpoints are not part of
+#     a public, documented API, so usage display may break if Anthropic changes them.
+#     The launcher itself does not depend on them and keeps working either way.
+#   - Disable the intro animation with CLAUDIUS_NOANIM=1 or `touch <config>/no-anim`.
+
+set -o pipefail
+VERSION="0.1.0"
+
+# macOS ships bash 3.2, which has no fractional read timeouts (Esc-to-go-back
+# lags). If a newer bash is installed, re-exec into it for a snappier UI.
+if ((BASH_VERSINFO[0] < 4)) && [[ ${BASH_SOURCE[0]} == "${0}" && ${1:-} != usage-line ]]; then
+  for _b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -x $_b ]] && exec "$_b" "$0" "$@"
+  done
+fi
+
+# Arrow keys start with Esc, so after a bare Esc we wait briefly for a follow-up
+# byte to tell them apart. bash >=4 can do this in 50ms (snappy) and we advertise
+# Esc as the back/quit key; bash 3.2 only has whole-second timeouts, so Esc lags
+# ~1s and we advertise the always-instant `q` instead (both keys always work).
+if ((BASH_VERSINFO[0] >= 4)); then ESC_T=0.05; BACKKEY="esc"; else ESC_T=1; BACKKEY="q"; fi
+
+# ----------------------------------------------------------------------------
+# Platform layer — everything OS-specific lives here so the rest stays generic.
+# ----------------------------------------------------------------------------
+case "$(uname -s)" in
+  Darwin) OS=macos ;;
+  Linux)  OS=linux ;;
+  *)      OS=other ;;
+esac
+have() { command -v "$1" >/dev/null 2>&1; }
+
+CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+PROJECTS_DIR="$CLAUDE_HOME/projects"
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/claudius"
+mkdir -p "$CFG"
+
+# Secret storage for backup-account tokens.
+secret_set() { # name token
+  case $OS in
+    macos) security add-generic-password -U -s "claudius-acct-$1" -a "$USER" -w "$2" >/dev/null ;;
+    *)     if have secret-tool; then
+             printf '%s' "$2" | secret-tool store --label="claudius:$1" service claudius account "$1"
+           else
+             mkdir -p "$CFG/tokens"; (umask 077; printf '%s' "$2" >"$CFG/tokens/$1")
+           fi ;;
+  esac
+}
+secret_get() { # name -> token
+  case $OS in
+    macos) security find-generic-password -s "claudius-acct-$1" -w 2>/dev/null ;;
+    *)     if have secret-tool; then secret-tool lookup service claudius account "$1" 2>/dev/null
+           else cat "$CFG/tokens/$1" 2>/dev/null; fi ;;
+  esac
+}
+# The "default" account is Claude Code's own login, read straight from its store.
+default_token() {
+  case $OS in
+    macos) security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
+             | jq -r '.claudeAiOauth.accessToken // empty' ;;
+    *)     jq -r '.claudeAiOauth.accessToken // empty' "$CLAUDE_HOME/.credentials.json" 2>/dev/null ;;
+  esac
+}
+
+# date/stat differ between BSD (macOS) and GNU (Linux).
+epoch_now()   { date +%s; }
+file_mtime()  { if [[ $OS == macos ]]; then stat -f %m "$1" 2>/dev/null; else stat -c %Y "$1" 2>/dev/null; fi; }
+iso_to_epoch(){ # ISO-8601 (UTC) -> epoch seconds
+  if [[ $OS == macos ]]; then date -u -j -f "%Y-%m-%dT%H:%M:%S" "${1%%.*}" +%s 2>/dev/null
+  else date -u -d "$1" +%s 2>/dev/null; fi
+}
+epoch_add_month() { # epoch -> epoch one calendar month later
+  if [[ $OS == macos ]]; then date -r "$1" -v+1m +%s 2>/dev/null
+  else local s; s=$(date -u -d "@$1" +%Y-%m-%dT%H:%M:%S); date -u -d "${s/T/ } +1 month" +%s 2>/dev/null; fi
+}
+gen_uuid() {
+  if have uuidgen; then uuidgen | tr 'A-Z' 'a-z'
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then cat /proc/sys/kernel/random/uuid
+  else python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null; fi
+}
+
+# ----------------------------------------------------------------------------
+# Config files and tunables
+# ----------------------------------------------------------------------------
+ACCT_FILE="$CFG/accounts"   # one backup-account name per line
+ARCH_FILE="$CFG/archived"   # archived session ids
+PIN_FILE="$CFG/pinned"      # pinned session ids
+NAMES_FILE="$CFG/names"     # id<TAB>custom name
+LABELC="$CFG/labels"        # label cache: id<TAB>mtime<TAB>label
+TRASH="$CFG/trash"          # deleted sessions (recoverable)
+UCACHE="$CFG/usage-cache"   # cached API responses
+mkdir -p "$TRASH"
+
+CURRENT_ACCT="default"
+LIMIT=25     # most chats shown in a full picker
+LANDING=8    # chats shown directly on the start screen
+ORIG_EDITOR="${VISUAL:-${EDITOR:-nano}}"   # the user's real editor, captured before we override it
+EDIT_HELPER="$CFG/ctrlg-editor"            # tiny wrapper Claude Code's Ctrl+G runs (see ensure_edit_helper)
+PYEDIT="$CFG/edit.py"                      # the in-app draft editor (curses; see ensure_pyedit)
+
+# ----------------------------------------------------------------------------
+# Terminal helpers and colors
+# ----------------------------------------------------------------------------
+RST=$'\033[0m'; B=$'\033[1m'; DIM=$'\033[2m'
+CY=$'\033[36m'; GR=$'\033[32m'; YE=$'\033[33m'; RD=$'\033[31m'
+cls()  { printf '\033[2J\033[H'; }                  # clear without needing $TERM
+pause(){ printf '  %bpress any key…%b' "$DIM" "$RST"; read -rsn1 </dev/tty; }
+info() { printf '\n  %b%s%b\n' "$YE" "$1" "$RST"; sleep 1.2; }
+
+# ----------------------------------------------------------------------------
+# Logo and intro animation
+# ----------------------------------------------------------------------------
+LOGO=(
+" ██████╗██╗      █████╗ ██╗   ██╗██████╗ ██╗██╗   ██╗███████╗"
+"██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██║██║   ██║██╔════╝"
+"██║     ██║     ███████║██║   ██║██║  ██║██║██║   ██║███████╗"
+"██║     ██║     ██╔══██║██║   ██║██║  ██║██║██║   ██║╚════██║"
+"╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝██║╚██████╔╝███████║"
+" ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝ ╚═════╝ ╚══════╝"
+)
+# Per-column cyan→green gradient, precomputed once. Truecolor gives a smooth
+# blend where the terminal supports it; otherwise a monotonic 256-color ramp.
+COLCOL=()
+if [[ ${COLORTERM:-} == *truecolor* || ${COLORTERM:-} == *24bit* || ${TERM:-} == *256color* ]]; then
+  _r0=34; _g0=211; _b0=238; _r1=74; _g1=222; _b1=128   # cyan-400 → green-400
+  for ((_c=0; _c<62; _c++)); do
+    COLCOL[_c]=$'\033[1;38;2;'"$((_r0+(_r1-_r0)*_c/61));$((_g0+(_g1-_g0)*_c/61));$((_b0+(_b1-_b0)*_c/61))"'m'
+  done
+else
+  _RAMP=(51 50 49 48 47 46)   # cyan → green along the 256-color cube edge
+  for ((_c=0; _c<62; _c++)); do COLCOL[_c]=$'\033[1;38;5;'"${_RAMP[$((_c*${#_RAMP[@]}/62))]}"'m'; done
+fi
+LOGO_COLORED=()
+for ((_r=0; _r<6; _r++)); do
+  _line=${LOGO[_r]}; _buf=""
+  for ((_cc=0; _cc<${#_line}; _cc++)); do
+    _ch=${_line:_cc:1}; [[ $_ch == " " ]] && { _buf+=" "; continue; }
+    _buf+="${COLCOL[_cc]}$_ch"
+  done
+  LOGO_COLORED[_r]="$_buf$RST"
+done
+draw_logo_rows() { local r; for ((r=0; r<6; r++)); do printf '\r\033[K  %s\n' "${LOGO_COLORED[r]}"; done; }
+draw_logo()      { printf '\n'; draw_logo_rows; }
+
+# A left-to-right gradient wipe that settles into the static logo. It clears at
+# the top so the menu can render directly beneath the same logo afterwards.
+# Deliberately has no keypress-to-skip poll: a non-blocking read here leaves the
+# terminal in a state that swallows the next keystroke.
+splash() {
+  [[ -n ${CLAUDIUS_NOANIM:-} || -f "$CFG/no-anim" || ! -t 1 ]] && return
+  local h=6 width=61 pos row line c ch d buf first=1
+  local OFF=$'\033[38;5;238m' HEAD=$'\033[1;38;5;231m'
+  printf '\033[2J\033[H\033[?25l\n'
+  for ((pos=-2; pos<=width+8; pos+=4)); do
+    ((first)) || printf '\033[%dA' "$h"; first=0
+    for ((row=0; row<h; row++)); do
+      line=${LOGO[row]}; buf=""
+      for ((c=0; c<${#line}; c++)); do
+        ch=${line:c:1}
+        if [[ $ch == " " ]]; then buf+=" "; continue; fi
+        d=$((pos-c))
+        if   ((d<0));  then buf+="$OFF$ch"
+        elif ((d<=1)); then buf+="$HEAD$ch"
+        else                buf+="${COLCOL[c]}$ch"; fi
+      done
+      printf '\r\033[K  %s%s\n' "$buf" "$RST"
+    done
+    sleep 0.02
+  done
+  printf '\033[%dA' "$h"; draw_logo_rows
+  printf '\033[H'
+  ANIM_RAN=1
+}
+
+# ----------------------------------------------------------------------------
+# Accounts
+# ----------------------------------------------------------------------------
+accounts() { echo "default"; [[ -f $ACCT_FILE ]] && grep -v '^[[:space:]]*$' "$ACCT_FILE"; }
+token_of() { [[ $1 == default ]] && default_token || secret_get "$1"; }
+
+# claudius switches accounts by exporting CLAUDE_CODE_OAUTH_TOKEN, which Claude
+# Code prefers over its stored login. "default" clears it and uses the stored one.
+set_account() {
+  if [[ $1 == default ]]; then unset CLAUDE_CODE_OAUTH_TOKEN; CURRENT_ACCT=default; return 0; fi
+  local tok; tok=$(token_of "$1")
+  [[ -z $tok ]] && { info "No token for '$1' — add it first."; return 1; }
+  export CLAUDE_CODE_OAUTH_TOKEN="$tok"; CURRENT_ACCT="$1"
+}
+
+add_account() {
+  cls; printf '\n  %bAdd account%b\n\n' "$B$CY" "$RST"
+  local name tok
+  printf '  Account name (e.g. work, backup2): '; read -r name </dev/tty
+  [[ -z $name ]] && return
+  printf '\n  This runs %bclaude setup-token%b. Sign in as "%s" in the browser,\n' "$B" "$RST" "$name"
+  printf '  then copy the token it prints.\n\n  Press Enter to continue…'; read -r _ </dev/tty
+  claude setup-token
+  printf '\n  Paste token: '; read -rs tok </dev/tty; echo
+  [[ -z $tok ]] && { info "No token — aborted."; return; }
+  secret_set "$name" "$tok"
+  grep -qxF "$name" "$ACCT_FILE" 2>/dev/null || echo "$name" >>"$ACCT_FILE"
+  info "Saved account '$name'."
+}
+
+# ----------------------------------------------------------------------------
+# Usage and limits (Claude account API — see note in the file header)
+# ----------------------------------------------------------------------------
+api_get() { # path account -> JSON, or non-zero on failure
+  have curl || return 1
+  local tok; tok=$(token_of "$2"); [[ -z $tok ]] && return 1
+  curl -s --max-time 8 "https://api.anthropic.com$1" \
+    -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20"
+}
+# Small on-disk cache so the UI stays responsive between renders.
+api_cached() { # path account ttl cachekey
+  local cf="$UCACHE/$2.$4.json" age j
+  mkdir -p "$UCACHE"
+  if [[ -f $cf ]]; then
+    age=$(( $(epoch_now) - $(file_mtime "$cf") ))
+    ((age < $3)) && { cat "$cf"; return; }
+  fi
+  j=$(api_get "$1" "$2") || return 1
+  [[ -n $j ]] && printf '%s' "$j" >"$cf"
+  printf '%s' "$j"
+}
+usage_json()   { api_cached /api/oauth/usage   "$1" 120  usage; }
+profile_json() { api_cached /api/oauth/profile "$1" 3600 profile; }
+
+fmt_dur() { # seconds -> "4d 6h" / "2h 01m" / "12m"
+  local d=$1; ((d<0)) && d=0
+  if   ((d>=86400)); then printf '%dd %dh'  $((d/86400)) $(((d%86400)/3600))
+  elif ((d>=3600));  then printf '%dh %02dm' $((d/3600))  $(((d%3600)/60))
+  else                    printf '%dm'       $(((d%3600)/60)); fi
+}
+rel_time() { local e; e=$(iso_to_epoch "$1"); [[ -z $e ]] && { echo "?"; return; }; fmt_dur $((e-$(epoch_now))); }
+rel_age()  { # file -> "45m"/"3h"/"2d"/"5w" since last change
+  local mt d; mt=$(file_mtime "$1"); [[ -z $mt ]] && return
+  d=$(( $(epoch_now) - mt ))
+  if   ((d<3600));   then echo "$((d/60))m"
+  elif ((d<86400));  then echo "$((d/3600))h"
+  elif ((d<604800)); then echo "$((d/86400))d"
+  else                    echo "$((d/604800))w"; fi
+}
+# Subscription renewal date isn't in the API, so estimate it as the monthly
+# anniversary of the start date (correct for monthly plans, off for annual).
+sub_renew_secs() {
+  local e now g=0; e=$(iso_to_epoch "$1"); [[ -z $e ]] && return 1
+  now=$(epoch_now)
+  while ((e<=now && g<60)); do e=$(epoch_add_month "$e"); [[ -z $e ]] && return 1; g=$((g+1)); done
+  echo $((e-now))
+}
+bar() { # utilization% used -> 16-wide bar of what's left, colored by headroom
+  local u=${1%.*}; ((u<0)) && u=0; ((u>100)) && u=100
+  local rem=$((100-u)) fill=$(((100-u)*16/100)) i out="" col=$GR
+  ((rem<=30)) && col=$YE; ((rem<=10)) && col=$RD
+  for ((i=0; i<16; i++)); do ((i<fill)) && out+="█" || out+="░"; done
+  printf '%b%s%b' "$col" "$out" "$RST"
+}
+usage_badge() { # account -> compact "5h 39% (2h 01m) · 7d 36% left"
+  local j fh sd a b col r
+  j=$(usage_json "$1") || { printf '%b(usage n/a)%b' "$DIM" "$RST"; return; }
+  fh=$(jq -r '.five_hour.utilization // empty' <<<"$j" 2>/dev/null); fh=${fh%.*}
+  sd=$(jq -r '.seven_day.utilization // empty' <<<"$j" 2>/dev/null); sd=${sd%.*}
+  r=$(jq -r '.five_hour.resets_at // ""' <<<"$j" 2>/dev/null)
+  [[ -z $fh && -z $sd ]] && { printf '%b(usage n/a)%b' "$DIM" "$RST"; return; }
+  a=$((100-${fh:-0})); b=$((100-${sd:-0})); col=$GR; ((a<=30))&&col=$YE; ((a<=10))&&col=$RD
+  printf '%b5h %d%%%b' "$col" "$a" "$RST"
+  [[ -n $r ]] && printf ' %b(%s)%b' "$DIM" "$(rel_time "$r")" "$RST"
+  printf ' %b· 7d %d%% left%b' "$DIM" "$b" "$RST"
+}
+freshest_idx() { # account names -> index with the most 5h headroom
+  local best=0 bestrem=-1 i rem j fh; local arr=("$@")
+  for i in "${!arr[@]}"; do
+    j=$(usage_json "${arr[i]}" 2>/dev/null)
+    fh=$(jq -r '.five_hour.utilization // 0' <<<"$j" 2>/dev/null); fh=${fh%.*}
+    rem=$((100-${fh:-0})); ((rem>bestrem)) && { bestrem=$rem; best=$i; }
+  done
+  echo "$best"
+}
+usage_block() { # account -> indented session / weekly / renewal lines
+  local j fh sd fr sr pj plan substat created u v s
+  j=$(usage_json "$1")
+  { [[ -z $j ]] || ! jq -e . >/dev/null 2>&1 <<<"$j"; } && { printf '         %busage unavailable%b\n' "$DIM" "$RST"; return; }
+  fh=$(jq -r '.five_hour.utilization // "-"' <<<"$j"); fr=$(jq -r '.five_hour.resets_at // ""' <<<"$j")
+  sd=$(jq -r '.seven_day.utilization // "-"' <<<"$j"); sr=$(jq -r '.seven_day.resets_at // ""' <<<"$j")
+  [[ $fh == "-" && $sd == "-" ]] && { printf '         %bauth error (token expired?)%b\n' "$RD" "$RST"; return; }
+  if [[ $fh != "-" ]]; then u=${fh%.*}
+    printf '         %bsession%b %s %3d%% left' "$DIM" "$RST" "$(bar "$u")" "$((100-u))"
+    [[ -n $fr ]] && printf ' %b· resets in %s%b' "$DIM" "$(rel_time "$fr")" "$RST"; printf '\n'; fi
+  if [[ $sd != "-" ]]; then v=${sd%.*}
+    printf '         %bweekly %b %s %3d%% left' "$DIM" "$RST" "$(bar "$v")" "$((100-v))"
+    [[ -n $sr ]] && printf ' %b· resets in %s%b' "$DIM" "$(rel_time "$sr")" "$RST"; printf '\n'; fi
+  pj=$(profile_json "$1" 2>/dev/null)
+  if [[ -n $pj ]] && jq -e '.organization' >/dev/null 2>&1 <<<"$pj"; then
+    created=$(jq -r '.organization.subscription_created_at // empty' <<<"$pj")
+    substat=$(jq -r '.organization.subscription_status // "?"' <<<"$pj")
+    if   jq -e '.account.has_claude_max==true' >/dev/null 2>&1 <<<"$pj"; then plan=Max
+    elif jq -e '.account.has_claude_pro==true' >/dev/null 2>&1 <<<"$pj"; then plan=Pro
+    else plan=$(jq -r '.organization.organization_type // "plan"' <<<"$pj"); fi
+    if [[ -n $created ]]; then s=$(sub_renew_secs "$created")
+      printf '         %brenews%b  in %s  %b(%s · %s · monthly est.)%b\n' "$DIM" "$RST" "$(fmt_dur "$s")" "$DIM" "$plan" "$substat" "$RST"
+    else printf '         %brenews%b  %b%s · %s%b\n' "$DIM" "$RST" "$DIM" "$plan" "$substat" "$RST"; fi
+  fi
+}
+print_usage_all() {
+  printf '\n  %bUsage & resets — per account%b\n\n' "$B$CY" "$RST"
+  local a mark
+  while IFS= read -r a; do
+    [[ $a == "$CURRENT_ACCT" ]] && mark="$GR●$RST" || mark="$DIM·$RST"
+    printf '  %b %b%s%b\n' "$mark" "$B" "$a" "$RST"
+    usage_block "$a"; echo
+  done < <(accounts)
+}
+
+# ----------------------------------------------------------------------------
+# Menu engine — arrow-key list that reads /dev/tty and reports via globals.
+# It is called as a statement (not in $(...)) so the globals survive; drawing
+# goes to stderr so stdout stays clean. Set MENU_ACT to allow extra action keys,
+# MENU_START to preselect a row. Results: MENU_SEL (index), MENU_KEY (the key).
+# ----------------------------------------------------------------------------
+menu() { # title option...
+  local title="$1"; shift
+  local opts=("$@") n=$# sel=${MENU_START:-0} i key rest first=1
+  MENU_KEY=""; MENU_START=0; ((sel<0||sel>=n)) && sel=0
+  printf '\033[?25l' >&2
+  [[ -n $title ]] && printf '\n  %b%s%b\n' "$B$CY" "$title" "$RST" >&2
+  while true; do
+    ((first)) || printf '\033[%dA' "$n" >&2; first=0
+    for ((i=0; i<n; i++)); do
+      printf '\r\033[K' >&2
+      if ((i==sel)); then printf '  %b▸ %s%b\n' "$GR$B" "${opts[i]}" "$RST" >&2
+      else                printf '    %b%s%b\n' "$DIM" "${opts[i]}" "$RST" >&2; fi
+    done
+    IFS= read -rsn1 key </dev/tty || { sel=-1; break; }
+    case $key in
+      # Read the rest of an escape sequence in one go; an integer timeout keeps
+      # bash 3.2 (still shipped on macOS) happy, and lone Esc cancels.
+      $'\033') read -rsn2 -t "$ESC_T" rest </dev/tty
+               case $rest in
+                 '[A'|'OA') ((sel=(sel-1+n)%n));;
+                 '[B'|'OB') ((sel=(sel+1)%n));;
+                 ''|$'\033')        sel=-1; break;;
+               esac;;
+      '')      MENU_KEY=enter; break;;
+      q|Q)     sel=-1; break;;
+      [1-9])   ((key<=n)) && { sel=$((key-1)); MENU_KEY=enter; break; };;
+      *)       [[ -n ${MENU_ACT:-} && " $MENU_ACT " == *" $key "* ]] && { MENU_KEY=$key; break; };;
+    esac
+  done
+  printf '\033[?25h' >&2
+  MENU_SEL=$sel
+  ((sel>=0))   # exit status: 0 = a row was chosen, 1 = cancelled
+}
+
+# A row of "key label" pairs with the keys highlighted — used by command bars.
+cbrow() {
+  local out="" sep=""
+  while (($#)); do out+="$sep$CY$B$1$RST $DIM$2$RST"; sep="   "; shift 2; done
+  printf '  %s\n' "$out"
+}
+
+# ----------------------------------------------------------------------------
+# Sessions: locating, labelling, archiving, pinning, naming
+# ----------------------------------------------------------------------------
+# Claude stores transcripts under projects/<cwd-with-non-alnum-replaced-by-dash>/.
+proj_dir() { printf '%s/%s' "$PROJECTS_DIR" "$(printf '%s' "$PWD" | sed 's,[^A-Za-z0-9],-,g')"; }
+
+# A chat's label is the first message the user actually typed. That lives in the
+# first queue "enqueue"; we skip injected/system content (skill lists, CLAUDE.md,
+# slash-command expansions) and cache the result by file mtime.
+label_of() { # jsonl -> label
+  local id mt cached t
+  id=${1##*/}; id=${id%.jsonl}
+  mt=$(file_mtime "$1")
+  if [[ -f $LABELC ]]; then
+    cached=$(awk -F'\t' -v i="$id" -v m="$mt" '$1==i && $2==m {print $3; exit}' "$LABELC")
+    [[ -n $cached ]] && { printf '%s' "$cached"; return; }
+  fi
+  t=$(head -12 "$1" 2>/dev/null \
+        | jq -rc 'select(.type=="queue-operation" and .operation=="enqueue") | (.content // empty)' 2>/dev/null \
+        | grep -vE '^[[:space:]]*$' | grep -viE '^[[:space:]]*(<|\[|caveat:)' | head -1)
+  [[ -z $t ]] && t=$(head -40 "$1" 2>/dev/null \
+        | jq -rc 'select((.message.role // .role)=="user") | (.message.content // .content)
+                  | if type=="string" then . else (.[]?|select(.type=="text").text) end' 2>/dev/null \
+        | grep -vE '^[[:space:]]*$' | grep -viE '^[[:space:]]*(<|\[|caveat:)' | head -1)
+  t=$(printf '%s' "$t" | tr '\n\t' '  ' | sed 's/^[[:space:]]*//; s/  */ /g')
+  [[ -z $t ]] && t="(untitled)"; t=${t:0:60}
+  if [[ -f $LABELC ]]; then awk -F'\t' -v i="$id" '$1!=i' "$LABELC" >"$LABELC.t" 2>/dev/null; mv "$LABELC.t" "$LABELC"; fi
+  printf '%s\t%s\t%s\n' "$id" "$mt" "$t" >>"$LABELC"
+  printf '%s' "$t"
+}
+
+is_archived()    { [[ -f $ARCH_FILE ]] && grep -qxF "$1" "$ARCH_FILE"; }
+archive_chat()   { is_archived "$1" || echo "$1" >>"$ARCH_FILE"; }
+unarchive_chat() { [[ -f $ARCH_FILE ]] || return; grep -vxF "$1" "$ARCH_FILE" >"$ARCH_FILE.t" 2>/dev/null; mv "$ARCH_FILE.t" "$ARCH_FILE"; }
+trash_chat()     { mv "$1" "$TRASH/" 2>/dev/null; }   # full jsonl path; recoverable
+confirm_delete() { menu "Delete this chat? (moved to claudius trash, recoverable)" "Cancel" "Delete, move to trash"; [[ $MENU_SEL == 1 ]]; }
+
+is_pinned()  { [[ -f $PIN_FILE ]] && grep -qxF "$1" "$PIN_FILE"; }
+toggle_pin() { if is_pinned "$1"; then grep -vxF "$1" "$PIN_FILE" >"$PIN_FILE.t" 2>/dev/null; mv "$PIN_FILE.t" "$PIN_FILE"; else echo "$1" >>"$PIN_FILE"; fi; }
+name_of()    { [[ -f $NAMES_FILE ]] || return; awk -F'\t' -v i="$1" '$1==i{print $2; exit}' "$NAMES_FILE"; }
+set_name()   { local t; t=$(mktemp); [[ -f $NAMES_FILE ]] && awk -F'\t' -v i="$1" '$1!=i' "$NAMES_FILE" >"$t"; [[ -n $2 ]] && printf '%s\t%s\n' "$1" "$2" >>"$t"; mv "$t" "$NAMES_FILE"; }
+rename_chat(){ printf '\r\033[K  %brename%b (empty = clear): ' "$CY" "$RST"; local nm; IFS= read -r nm </dev/tty; set_name "$1" "$nm"; }
+
+# Full-screen "name this chat" prompt — shown after a new chat's first run and
+# from the post-exit menu. Empty input keeps whatever name is already set.
+name_chat() {
+  local cur nm; cur=$(name_of "$1")
+  cls
+  printf '\n  %bname this chat%b   %b(Enter to skip)%b\n' "$B$CY" "$RST" "$DIM" "$RST"
+  [[ -n $cur ]] && printf '  %bcurrent: %s%b\n' "$DIM" "$cur" "$RST"
+  printf '\n  %bname ›%b ' "$CY$B" "$RST"
+  IFS= read -r nm </dev/tty
+  [[ -n $nm ]] && set_name "$1" "$nm"
+}
+
+# Display text for a chat: custom name if set, else the cached label, ★ if pinned.
+disp_label() {
+  local nm base; nm=$(name_of "$1"); base=${nm:-$(label_of "$2")}
+  is_pinned "$1" && printf '★ %s' "$base" || printf '%s' "$base"
+}
+
+# cwd is recorded inside each transcript; reading it lets us resume a chat from
+# any directory (and reconstruct the real path, which the dir name can't).
+cwd_of() { grep -m1 -o '"cwd":"[^"]*"' "$1" 2>/dev/null | head -1 | sed 's/^"cwd":"//; s/"$//'; }
+
+# ----------------------------------------------------------------------------
+# Running Claude Code
+# ----------------------------------------------------------------------------
+# Ctrl+G in Claude Code opens $EDITOR on the prompt input. We point that at a
+# tiny wrapper so Ctrl+G becomes a draft picker — while git commit messages and
+# the like still go to the user's real editor. Pure local editing: no model turn.
+ensure_edit_helper() {
+  local self; self=$(command -v claudius 2>/dev/null || printf '%s' "$0")
+  cat >"$EDIT_HELPER" <<EOF
+#!/usr/bin/env bash
+# Auto-generated by claudius. Ctrl+G in Claude Code -> draft picker; git etc. -> your editor.
+case "\$1" in
+  *COMMIT_EDITMSG*|*MERGE_MSG*|*TAG_EDITMSG*|*git-rebase-todo*|*addp-hunk-edit*)
+    exec "\${REAL_EDITOR:-nano}" "\$@" ;;
+  *) exec "$self" edit-input "\$@" ;;
+esac
+EOF
+  chmod +x "$EDIT_HELPER"
+}
+
+# Called by the Ctrl+G wrapper with the file holding the current prompt input.
+# Lets the user drop a saved draft into the prompt (or edit the current text),
+# then writes it back so Claude Code loads it into the input — no message sent.
+cmd_edit_input() { # file
+  local file="${1:-}"; [[ -z $file ]] && return
+  local dir f id pass; local ids=() files=() labels=()
+  dir=$(clip_dir)
+  for pass in 1 0; do
+    while IFS= read -r f; do
+      [[ -f $f ]] || continue; id=${f##*/}; id=${id%.txt}; is_archived "$id" && continue
+      if ((pass)); then is_pinned "$id" || continue; else is_pinned "$id" && continue; fi
+      ids+=("$id"); files+=("$f"); labels+=("$(clip_label "$f")")
+    done < <(ls -t "$dir"/*.txt 2>/dev/null)
+  done
+  cls
+  printf '\n  %bdrafts — pick one to drop into your prompt%b   %b%s keeps current text%b\n\n' \
+    "$B$CY" "$RST" "$DIM" "$BACKKEY" "$RST"
+  local opts=() n=${#labels[@]} i
+  for ((i=0; i<n; i++)); do opts+=("${labels[i]}"); done
+  opts+=("✎  edit current text" "＋  write a new draft")
+  menu "" "${opts[@]}" || return        # esc/q -> leave the input unchanged
+  local sel=$MENU_SEL
+  if   ((sel<n));  then cp "${files[sel]}" "$file"                    # insert the draft as-is
+  elif ((sel==n)); then compose "$file"                              # edit the current input
+  else : >"$file"; compose "$file"                                    # new draft: edit, then also save it
+       grep -qvE '^[[:space:]]*$' "$file" 2>/dev/null && cp "$file" "$dir/$(gen_uuid).txt"
+  fi
+}
+
+# Forcing the session id means we can resume this exact chat after switching
+# accounts (the token is fixed when claude starts, so switching = restart).
+run_claude() { # new|resume  [session-id]  [initial-prompt]
+  local mode="$1" sid="${2:-}" prompt="${3:-}" was_new=0
+  [[ $mode == new ]] && { sid=$(gen_uuid); was_new=1; }
+  ensure_edit_helper
+  export REAL_EDITOR="$ORIG_EDITOR" EDITOR="$EDIT_HELPER" VISUAL="$EDIT_HELPER"
+  export CLAUDIUS_ACCT="$CURRENT_ACCT"   # so the status line can show which account this session uses
+  while true; do
+    cls
+    printf '  %bclaudius%b   %baccount%b %b%s%b   %bchat%b %b%s%b\n' \
+      "$CY$B" "$RST" "$DIM" "$RST" "$GR$B" "$CURRENT_ACCT" "$RST" "$DIM" "$RST" "$YE" "${sid:0:8}" "$RST"
+    printf '  %bquit claude (Ctrl-C or /quit) to switch account · Ctrl+G for your drafts%b\n\n' "$DIM" "$RST"
+    if [[ $mode == new ]]; then
+      if [[ -n $prompt ]]; then claude --session-id "$sid" "$prompt"; else claude --session-id "$sid"; fi
+      mode=resume
+    else
+      if [[ -n $prompt ]]; then claude --resume "$sid" "$prompt"; else claude --resume "$sid"; fi
+    fi
+    prompt=""   # only seed on the first launch, not on switch-and-resume
+    # Once a brand-new chat has actually started, offer to give it a name.
+    if ((was_new)); then
+      was_new=0
+      [[ -f "$(proj_dir)/$sid.jsonl" && -z $(name_of "$sid") ]] && name_chat "$sid"
+    fi
+    echo
+    menu "claude exited" "Switch account & continue this chat" "Rename this chat" "Back to menu" || return
+    case $MENU_SEL in
+      0) switch_account_inline ;;
+      1) name_chat "$sid" ;;
+      *) return ;;
+    esac
+  done
+}
+
+switch_account_inline() {
+  cls; printf '  %bfetching usage…%b' "$DIM" "$RST"
+  local accts=() a; while IFS= read -r a; do accts+=("$a"); done < <(accounts)
+  printf '\r\033[K'; print_usage_all
+  MENU_START=$(freshest_idx "${accts[@]}")   # preselect the account with most headroom
+  menu "Accounts — select to switch · ▸ most headroom · $BACKKEY to close" "${accts[@]}" || return
+  set_account "${accts[$MENU_SEL]}"
+}
+
+# ----------------------------------------------------------------------------
+# Chat browser — a searchable list with per-chat actions. Caller sets
+# BR_FILES (paths), BR_SHOWDIR (prefix folder name), BR_ARCH (show archived).
+# ----------------------------------------------------------------------------
+browse_chats() { # title
+  local title="$1"; BR_FILTER=""
+  if [[ -n ${BR_START_SEARCH:-} ]]; then   # entered via "find": prompt right away
+    cls; printf '\n  %b%s%b\n\n  %bsearch:%b ' "$B$CY" "$title" "$RST" "$CY$B" "$RST"
+    IFS= read -r BR_FILTER </dev/tty; BR_START_SEARCH=
+  fi
+  while true; do
+    local ids=() paths=() cwds=() labels=() pass f id cwd lbl
+    for pass in 1 0; do                     # pinned first
+      for f in "${BR_FILES[@]}"; do
+        [[ -f $f ]] || continue
+        id=${f##*/}; id=${id%.jsonl}
+        if ((BR_ARCH)); then is_archived "$id" || continue; else is_archived "$id" && continue; fi
+        if ((pass)); then is_pinned "$id" || continue; else is_pinned "$id" && continue; fi
+        cwd=$(cwd_of "$f")
+        lbl=$(disp_label "$id" "$f"); ((BR_SHOWDIR)) && lbl="[${cwd##*/}] $lbl"
+        [[ -n $BR_FILTER ]] && ! printf '%s' "$lbl" | grep -qiF "$BR_FILTER" && continue
+        ids+=("$id"); paths+=("$f"); cwds+=("$cwd"); labels+=("$lbl")
+      done
+    done
+    if ((${#ids[@]}==0)); then
+      [[ -n $BR_FILTER ]] && { info "No match for '$BR_FILTER'."; BR_FILTER=""; continue; }
+      info "Nothing here."; return
+    fi
+    cls
+    printf '\n  %b%s%b%b\n' "$B$CY" "$title" "$RST" "${BR_FILTER:+  $YE· filter: $BR_FILTER$RST}"
+    cbrow "↵" "open" "a" "$( ((BR_ARCH)) && echo unarchive || echo archive )" "d" "delete" "r" "rename" "p" "pin" "/" "search" "$BACKKEY" "back"
+    MENU_ACT="a d r p /"; menu "" "${labels[@]}"; local rc=$?; MENU_ACT=""
+    ((rc!=0)) && return
+    local i=$MENU_SEL
+    case $MENU_KEY in
+      a) ((BR_ARCH)) && unarchive_chat "${ids[i]}" || archive_chat "${ids[i]}" ;;
+      d) confirm_delete && trash_chat "${paths[i]}" ;;
+      r) rename_chat "${ids[i]}" ;;
+      p) toggle_pin "${ids[i]}" ;;
+      /) printf '\r\033[K  %bsearch:%b ' "$CY" "$RST"; IFS= read -r BR_FILTER </dev/tty ;;
+      *) [[ -d ${cwds[i]} ]] && { cd "${cwds[i]}" || true; }; run_claude resume "${ids[i]}"; return ;;
+    esac
+  done
+}
+load_files() { BR_FILES=(); local f; while IFS= read -r f; do BR_FILES+=("$f"); done < <(ls -t $1 2>/dev/null | head -$LIMIT); }
+
+# Jump to any project that still has active chats (and cd there).
+project_jump() {
+  local cwds=() labels=() d f cwd cnt jf id
+  while IFS= read -r d; do
+    f=$(ls -t "$d"*.jsonl 2>/dev/null | head -1); [[ -z $f ]] && continue
+    cwd=$(cwd_of "$f"); [[ -z $cwd ]] && continue
+    cnt=0
+    for jf in "$d"*.jsonl; do
+      [[ -f $jf ]] || continue
+      id=${jf##*/}; id=${id%.jsonl}; is_archived "$id" && continue
+      cnt=$((cnt+1))
+    done
+    ((cnt==0)) && continue
+    cwds+=("$cwd"); labels+=("$(printf '%-32s %s' "${cwd/#$HOME/~}" "($cnt)")")
+  done < <(ls -dt "$PROJECTS_DIR"/*/ 2>/dev/null)
+  cls
+  printf '\n  %bnew project? just open %bclaudius%b%b inside that folder%b\n' "$DIM" "$CY$B" "$RST" "$DIM" "$RST"
+  ((${#cwds[@]}==0)) && { printf '\n  %b(no projects with active chats yet)%b\n' "$DIM" "$RST"; pause; return; }
+  menu "Jump to project" "${labels[@]}" || return
+  local t=${cwds[$MENU_SEL]}
+  [[ -d $t ]] && cd "$t" || info "Folder no longer exists: $t"
+}
+
+more_menu() {
+  menu "More" "All folders" "Archived chats" "Add account" "Back" || return
+  case $MENU_SEL in
+    0) load_files "$PROJECTS_DIR/*/*.jsonl"; BR_SHOWDIR=1; BR_ARCH=0; browse_chats "All folders" ;;
+    1) load_files "$PROJECTS_DIR/*/*.jsonl"; BR_SHOWDIR=1; BR_ARCH=1; browse_chats "Archived chats" ;;
+    2) add_account ;;
+  esac
+}
+
+# Active (non-archived) chats of the current folder, pinned first. Ids/paths only;
+# labels are looked up lazily for just the rows we draw.
+collect_folder() {
+  cids=(); cpaths=(); local pass f id
+  for pass in 1 0; do
+    while IFS= read -r f; do
+      id=${f##*/}; id=${id%.jsonl}
+      is_archived "$id" && continue
+      if ((pass)); then is_pinned "$id" || continue; else is_pinned "$id" && continue; fi
+      cids+=("$id"); cpaths+=("$f")
+    done < <(ls -t "$(proj_dir)"/*.jsonl 2>/dev/null)
+  done
+}
+
+# ----------------------------------------------------------------------------
+# Clipboard — pre-written prompt drafts, stored per project. Reuses the same
+# archive / pin / rename / trash machinery as chats (ids are unique uuids, so the
+# shared state never collides). A draft is a plain .txt; its first line is the title.
+# ----------------------------------------------------------------------------
+CLIPS_DIR="$CFG/clips"
+clip_dir()   { printf '%s/%s' "$CLIPS_DIR" "$(printf '%s' "$PWD" | sed 's,[^A-Za-z0-9],-,g')"; }
+clip_label() { # file -> custom name, else first non-empty line
+  local id nm first; id=${1##*/}; id=${id%.txt}; nm=$(name_of "$id")
+  [[ -n $nm ]] && { printf '%s' "$nm"; return; }
+  first=$(grep -m1 -vE '^[[:space:]]*$' "$1" 2>/dev/null | sed 's/^[[:space:]]*//')
+  printf '%s' "${first:0:60}"
+}
+clip_count() { # number of active (non-archived) drafts in the current folder
+  local f id n=0
+  for f in "$(clip_dir)"/*.txt; do
+    [[ -f $f ]] || continue; id=${f##*/}; id=${id%.txt}; is_archived "$id" && continue; n=$((n+1))
+  done
+  echo "$n"
+}
+# A small built-in composer — no external editor, and you can always get out:
+# Esc opens a Save / Discard prompt. The cursor stays at the end (type, Enter for
+# a new line, Backspace to delete). Writes the file on save.
+# Edit draft text in a real terminal editor. A bash-built editor can't handle
+# long/pasted/wrapping text reliably, so we hand off to nano by default — it
+# shows its exit keys on screen (Ctrl-X), unlike vi/vim. `-w` stops it inserting
+# hard line breaks into long lines (important for prompts). Override the editor
+# with CLAUDIUS_EDITOR (e.g. "vim", "code --wait"). Draft *selection* stays in
+# claudius; only the typing happens here.
+# The in-app draft editor is a small curses program (Python stdlib — no extra
+# dependency). bash genuinely can't do reliable multi-line editing with paste and
+# scrolling; curses does the terminal work properly. We write it out and run it.
+ensure_pyedit() {
+  cat >"$PYEDIT" <<'PYEOF'
+#!/usr/bin/env python3
+# claudius in-app draft editor. Edits argv[1] in place; Ctrl-S saves, Ctrl-Q discards.
+import curses, sys, termios
+
+def run(stdscr, path):
+    try:
+        text = open(path, "r", encoding="utf-8", errors="replace").read()
+    except OSError:
+        text = ""
+    lines = text.split("\n") or [""]
+    if not lines:
+        lines = [""]
+    try:                       # raw paste, not bracketed-paste escape sequences
+        with open("/dev/tty", "w") as t:
+            t.write("\033[?2004l"); t.flush()
+    except OSError:
+        pass
+    curses.raw(); stdscr.keypad(True)
+    try:                       # make sure Ctrl-S/Ctrl-Q aren't eaten by flow control
+        fd = sys.stdin.fileno(); a = termios.tcgetattr(fd)
+        a[0] &= ~termios.IXON; termios.tcsetattr(fd, termios.TCSANOW, a)
+    except Exception:
+        pass
+    try:
+        curses.start_color(); curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+    except curses.error:
+        pass
+    HDR = curses.color_pair(1) | curses.A_BOLD
+    DIM = curses.A_DIM
+    cy, cx, top = len(lines) - 1, len(lines[-1]), 0
+    TOP = 4
+
+    def bs():
+        nonlocal cy, cx
+        if cx > 0:
+            lines[cy] = lines[cy][:cx-1] + lines[cy][cx:]; cx -= 1
+        elif cy > 0:
+            p = len(lines[cy-1]); lines[cy-1] += lines[cy]
+            del lines[cy]; cy -= 1; cx = p
+
+    while True:
+        h, w = stdscr.getmaxyx(); avail = max(1, h - TOP)
+        if cy < top: top = cy
+        if cy >= top + avail: top = cy - avail + 1
+        stdscr.erase()
+        stdscr.addnstr(0, 2, "compose draft", w - 3, HDR)
+        stdscr.addnstr(1, 2, "^X save & close · esc discard · arrows move · paste ok", w - 3, DIM)
+        stdscr.addnstr(2, 2, "─" * 46, w - 3, DIM)
+        for i in range(avail):
+            li = top + i
+            if li >= len(lines): break
+            stdscr.addnstr(TOP + i, 2, lines[li], w - 3)
+        try: stdscr.move(TOP + (cy - top), 2 + min(cx, w - 3))
+        except curses.error: pass
+        stdscr.refresh()
+
+        try: ch = stdscr.get_wch()    # one event at a time; curses refresh() diffs, so no flicker
+        except (curses.error, KeyboardInterrupt): continue
+        if isinstance(ch, str):
+            o = ord(ch) if len(ch) == 1 else -1
+            if ch in ("\n", "\r"):
+                tail = lines[cy][cx:]; lines[cy] = lines[cy][:cx]
+                lines.insert(cy + 1, tail); cy += 1; cx = 0
+            elif o in (24, 15, 19): open(path, "w", encoding="utf-8").write("\n".join(lines)); return
+            elif o in (27, 17, 3): return
+            elif o in (127, 8): bs()
+            elif o == 9: lines[cy] = lines[cy][:cx] + "  " + lines[cy][cx:]; cx += 2
+            elif o >= 32: lines[cy] = lines[cy][:cx] + ch + lines[cy][cx:]; cx += 1
+        elif ch == curses.KEY_UP and cy > 0: cy -= 1; cx = min(cx, len(lines[cy]))
+        elif ch == curses.KEY_DOWN and cy < len(lines) - 1: cy += 1; cx = min(cx, len(lines[cy]))
+        elif ch == curses.KEY_LEFT:
+            if cx > 0: cx -= 1
+            elif cy > 0: cy -= 1; cx = len(lines[cy])
+        elif ch == curses.KEY_RIGHT:
+            if cx < len(lines[cy]): cx += 1
+            elif cy < len(lines) - 1: cy += 1; cx = 0
+        elif ch == curses.KEY_HOME: cx = 0
+        elif ch == curses.KEY_END: cx = len(lines[cy])
+        elif ch == curses.KEY_BACKSPACE: bs()
+        elif ch == curses.KEY_DC:
+            if cx < len(lines[cy]): lines[cy] = lines[cy][:cx] + lines[cy][cx+1:]
+            elif cy < len(lines) - 1: lines[cy] += lines[cy+1]; del lines[cy+1]
+        elif ch == curses.KEY_NPAGE: cy = min(len(lines)-1, cy + avail - 1)
+        elif ch == curses.KEY_PPAGE: cy = max(0, cy - avail + 1)
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2: sys.exit(2)
+    try: curses.wrapper(run, sys.argv[1])
+    except Exception: sys.exit(1)
+PYEOF
+}
+compose() { # file -> edit draft text in the in-app editor (curses; nano fallback)
+  if have python3; then ensure_pyedit; python3 "$PYEDIT" "$1"; return; fi
+  local ed="${CLAUDIUS_EDITOR:-nano -w}"
+  have "${ed%% *}" || ed="vi"
+  # shellcheck disable=SC2086  # word-split so "code --wait" works
+  $ed "$1"
+}
+copy_to_os() {   # file -> system clipboard; non-zero if no copier is installed
+  if   have pbcopy;  then pbcopy  <"$1"
+  elif have wl-copy; then wl-copy <"$1"
+  elif have xclip;   then xclip -selection clipboard <"$1"
+  elif have xsel;    then xsel -ib <"$1"
+  else return 1; fi
+}
+new_clip() {
+  local dir f; dir=$(clip_dir); mkdir -p "$dir"
+  f="$dir/$(gen_uuid).txt"; : >"$f"
+  compose "$f"
+  grep -qvE '^[[:space:]]*$' "$f" 2>/dev/null || rm -f "$f"   # discard an empty draft
+}
+view_clip() { # file
+  while true; do
+    cls
+    printf '\n  %bdraft%b  %b%s%b\n\n' "$B$CY" "$RST" "$DIM" "$(clip_label "$1")" "$RST"
+    sed 's/^/  │ /' "$1" 2>/dev/null
+    echo
+    menu "" "Edit" "Copy to clipboard" "Send to new chat" "Send to an existing chat" "Back" || return
+    case $MENU_SEL in
+      0) compose "$1" ;;
+      1) copy_to_os "$1" && info "Copied to clipboard." || info "No clipboard tool found (pbcopy / xclip / wl-copy)." ;;
+      2) run_claude new "" "$(cat "$1")"; return ;;
+      3) collect_folder
+         if ((${#cids[@]}==0)); then info "No chats in this folder to attach to."
+         else
+           local labels=() i; for ((i=0; i<${#cids[@]}; i++)); do labels+=("$(disp_label "${cids[i]}" "${cpaths[i]}")"); done
+           menu "Attach to which chat?" "${labels[@]}" && { run_claude resume "${cids[$MENU_SEL]}" "$(cat "$1")"; return; }
+         fi ;;
+      *) return ;;
+    esac
+  done
+}
+clipboard_screen() {
+  local dir; dir=$(clip_dir)
+  while true; do
+    local ids=() files=() labels=() pass f id lbl
+    for pass in 1 0; do   # pinned first
+      while IFS= read -r f; do
+        [[ -f $f ]] || continue
+        id=${f##*/}; id=${id%.txt}
+        is_archived "$id" && continue
+        if ((pass)); then is_pinned "$id" || continue; else is_pinned "$id" && continue; fi
+        lbl=$(clip_label "$f"); is_pinned "$id" && lbl="★ $lbl"
+        ids+=("$id"); files+=("$f"); labels+=("$lbl")
+      done < <(ls -t "$dir"/*.txt 2>/dev/null)
+    done
+    cls
+    printf '\n  %bClipboard%b  %b%s%b\n' "$B$CY" "$RST" "$DIM" "${PWD/#$HOME/~}" "$RST"
+    cbrow "↵" "open" "n" "new" "c" "copy" "a" "archive" "d" "delete" "r" "rename" "p" "pin" "$BACKKEY" "back"
+    if ((${#ids[@]}==0)); then
+      printf '\n  %bno drafts here — press %bn%b%b to write one%b\n' "$DIM" "$CY$B" "$RST" "$DIM" "$RST"
+      local k; IFS= read -rsn1 k </dev/tty
+      case $k in n|N) new_clip ;; *) return ;; esac
+      continue
+    fi
+    MENU_ACT="n c a d r p"; menu "" "${labels[@]}"; local rc=$?; MENU_ACT=""
+    ((rc!=0)) && return
+    local i=$MENU_SEL
+    case $MENU_KEY in
+      n) new_clip ;;
+      c) copy_to_os "${files[i]}" && info "Copied to clipboard." || info "No clipboard tool found." ;;
+      a) archive_chat "${ids[i]}" ;;
+      d) confirm_delete && trash_chat "${files[i]}" ;;
+      r) rename_chat "${ids[i]}" ;;
+      p) toggle_pin "${ids[i]}" ;;
+      *) view_clip "${files[i]}" ;;
+    esac
+  done
+}
+
+# ----------------------------------------------------------------------------
+# Landing screen: logo + recent chats + command bar. Arrow keys move through the
+# chats; everything else is a single-key command shown in the bar. Reports the
+# chosen command via LKEY and the selected chat index via LSEL.
+# ----------------------------------------------------------------------------
+command_bar() {
+  printf '  %b%s%b\n' "$DIM" "──────────────────────────────────────────────────────" "$RST"
+  cbrow "↵" "open" "a" "archive" "d" "delete" "r" "rename" "p" "pin"
+  cbrow "n" "new" "/" "search" "c" "clipboard" "s" "accounts" "j" "jump" "m" "more" "$BACKKEY" "quit"
+}
+
+landing_menu() {
+  local n=${#cids[@]} sel=0 key rest i lbl tm
+  local showN=$n; ((showN>LANDING)) && showN=$LANDING
+  local hasMore=0; ((n>showN)) && hasMore=1
+  local listN=$((showN+hasMore))
+  local rows=() times=()
+  for ((i=0; i<showN; i++)); do rows[i]=$(disp_label "${cids[i]}" "${cpaths[i]}"); times[i]=$(rel_age "${cpaths[i]}"); done
+  local badge folder dn; badge=$(usage_badge "$CURRENT_ACCT"); folder=${PWD/#$HOME/~}; dn=$(clip_count)
+  # On the first render right after the animation, skip the clear so the logo the
+  # animation left on screen stays put and the menu simply appears below it.
+  if [[ -n $LANDING_SHOWN || -z $ANIM_RAN ]]; then cls; fi
+  LANDING_SHOWN=1; printf '\033[?25l'
+  while true; do
+    printf '\033[H'
+    draw_logo
+    printf '\n  %b%s%b   %s\n' "$GR$B" "$CURRENT_ACCT" "$RST" "$badge"
+    if ((dn>0)); then printf '  %b%s · %d active · %d drafts%b\n\n' "$DIM" "$folder" "$n" "$dn" "$RST"
+    else              printf '  %b%s · %d active%b\n\n'            "$DIM" "$folder" "$n" "$RST"; fi
+    if ((n==0)); then
+      printf '  %bno active chats here — press %bn%b%b to start one%b\n' "$DIM" "$CY$B" "$RST" "$DIM" "$RST"
+    else
+      for ((i=0; i<listN; i++)); do
+        printf '\r\033[K'
+        if ((hasMore && i==showN)); then
+          if ((i==sel)); then printf '  %b▸ ⋯ %d more%b\n' "$GR$B" "$((n-showN))" "$RST"
+          else                printf '    %b⋯ %d more%b\n' "$DIM" "$((n-showN))" "$RST"; fi
+        else
+          lbl=${rows[i]:0:50}; tm=${times[i]}
+          if ((i==sel)); then printf '  %b▸ %-50s%b %b%3s%b\n' "$GR$B" "$lbl" "$RST" "$DIM" "$tm" "$RST"
+          else                printf '    %s%-50s%s %b%3s%b\n' "$RST" "$lbl" "$RST" "$DIM" "$tm" "$RST"; fi
+        fi
+      done
+    fi
+    printf '\n'; command_bar
+    printf '\033[J'
+    IFS= read -rsn1 key </dev/tty || { LKEY='quit'; break; }
+    case $key in
+      $'\033') read -rsn2 -t "$ESC_T" rest </dev/tty
+               case $rest in
+                 '[A') ((listN)) && sel=$(((sel-1+listN)%listN));;
+                 '[B') ((listN)) && sel=$(((sel+1)%listN));;
+                 ''|$'\033')   LKEY='quit'; break;;
+               esac;;
+      '') if ((n==0)); then LKEY='new'; break; fi
+          if ((hasMore && sel==showN)); then LKEY='listall'; break; fi
+          LSEL=$sel; LKEY='open'; break;;
+      n|N) LKEY='new'; break;;
+      /)   LKEY='find'; break;;
+      c|C) LKEY='clipboard'; break;;
+      s|S) LKEY='accounts'; break;;
+      j|J) LKEY='jump'; break;;
+      m|M) LKEY='more'; break;;
+      q|Q) LKEY='quit'; break;;
+      a|d|r|p) if ((n>0)) && ! ((hasMore && sel==showN)); then LSEL=$sel; LKEY=$key; break; fi;;
+    esac
+  done
+  printf '\033[?25h'
+}
+
+run_tui() {
+  trap 'printf "\033[?25h" >&2' EXIT INT   # restore the cursor on the way out
+  splash
+  set_account default
+  while true; do
+    collect_folder
+    landing_menu
+    case $LKEY in
+      open)    run_claude resume "${cids[LSEL]}" ;;
+      new)     run_claude new ;;
+      find)    load_files "$(proj_dir)/*.jsonl"; BR_SHOWDIR=0; BR_ARCH=0; BR_START_SEARCH=1; browse_chats "Search · this folder" ;;
+      listall) load_files "$(proj_dir)/*.jsonl"; BR_SHOWDIR=0; BR_ARCH=0; browse_chats "This folder · all chats" ;;
+      more)      more_menu ;;
+      clipboard) clipboard_screen ;;
+      accounts)  switch_account_inline ;;
+      jump)      project_jump ;;
+      a)       archive_chat "${cids[LSEL]}" ;;
+      d)       confirm_delete && trash_chat "${cpaths[LSEL]}" ;;
+      r)       rename_chat "${cids[LSEL]}" ;;
+      p)       toggle_pin "${cids[LSEL]}" ;;
+      quit)    cls; exit 0 ;;
+    esac
+  done
+}
+
+# ----------------------------------------------------------------------------
+# claudius serve — run the UI as a web terminal, bound to the local Tailscale
+# address when available so only your own devices can reach it. Anyone who opens
+# it gets a full shell on this machine, so keep it on a trusted network.
+# ----------------------------------------------------------------------------
+cmd_serve() {
+  if ! have ttyd; then
+    cat >&2 <<EOF
+claudius serve needs 'ttyd' (a small web-terminal server).
+  macOS:  brew install ttyd
+  Linux:  https://github.com/tsl0922/ttyd#installation
+EOF
+    return 1
+  fi
+  local port="${CLAUDIUS_SERVE_PORT:-7681}" bind=127.0.0.1 host=localhost
+  if have tailscale; then
+    local tip; tip=$(tailscale ip -4 2>/dev/null | head -1)
+    [[ -n $tip ]] && { bind=$tip; host=$tip; }
+  fi
+  local user=claudius pass; pass=$(gen_uuid); pass=${pass//-/}; pass=${pass:0:12}
+  local self; self=$(command -v claudius || printf '%s' "$0")
+  printf '%bclaudius web terminal%b\n' "$B$CY" "$RST"
+  printf '  open on your phone (same network):  %bhttp://%s:%s%b\n' "$CY" "$host" "$port" "$RST"
+  printf '  user: %s   pass: %s\n' "$user" "$pass"
+  [[ $bind == 127.0.0.1 ]] && printf '  %bnote: bound to localhost (Tailscale not detected). See README for remote access.%b\n' "$YE" "$RST"
+  printf '  %bwarning: this grants full shell access to this machine.%b  Ctrl-C to stop.\n\n' "$YE" "$RST"
+  local run=(ttyd -p "$port" -i "$bind" -c "$user:$pass" -W "$self")
+  # caffeinate keeps a Mac awake while it's serving so the phone can reach it.
+  if [[ $OS == macos ]] && have caffeinate; then caffeinate -s "${run[@]}"; else "${run[@]}"; fi
+}
+
+# Quick-capture a prompt draft for the current project from any terminal.
+cmd_clip() {
+  local dir f; dir=$(clip_dir); mkdir -p "$dir"
+  f="$dir/$(gen_uuid).txt"
+  if (($#)); then
+    printf '%s\n' "$*" >"$f"; printf 'saved draft in %s\n' "${dir/#$HOME/~}"
+  else
+    compose "$f"
+    if grep -qvE '^[[:space:]]*$' "$f" 2>/dev/null; then echo 'saved draft.'; else rm -f "$f"; echo 'empty — nothing saved.'; fi
+  fi
+}
+
+# Non-interactive draft access for the /clip and /clips Claude Code commands.
+#   clips --list        -> numbered list of this project's drafts
+#   clips <number|word> -> that draft's text, verbatim (so /clip fires it)
+#   clips               -> a one-line hint (so a bare /clip costs almost nothing)
+cmd_clips() {
+  local arg="${1:-}" dir f id i=0; local files=()
+  dir=$(clip_dir)
+  while IFS= read -r f; do
+    id=${f##*/}; id=${id%.txt}; is_archived "$id" && continue; files+=("$f")
+  done < <(ls -t "$dir"/*.txt 2>/dev/null)
+  if ((${#files[@]}==0)); then echo "No saved prompt drafts in this project yet — write some in claudius (press c)."; return; fi
+  case $arg in
+    --list)
+      echo "Your saved prompt drafts — run /clip <number> to use one:"
+      for f in "${files[@]}"; do i=$((i+1)); printf '  %d. %s\n' "$i" "$(clip_label "$f")"; done ;;
+    "")
+      echo "Run /clips to list your drafts, or /clip <number or word> to use one." ;;
+    *)
+      local q="$*"
+      if [[ $q =~ ^[0-9]+$ ]] && ((q>=1 && q<=${#files[@]})); then cat "${files[$((q-1))]}"; return; fi
+      for f in "${files[@]}"; do
+        if clip_label "$f" | grep -qiF -- "$q" || grep -qiF -- "$q" "$f"; then cat "$f"; return; fi
+      done
+      echo "No draft matching \"$q\". Run /clips to list them." ;;
+  esac
+}
+
+# A compact, live usage line for Claude Code's status line. Claude Code already
+# passes this session's rate limits on stdin (rate_limits.*.used_percentage and
+# resets_at as epoch), so no API call is needed — it's instant and always current.
+cmd_usage_line() {
+  have jq || return
+  local j fh sd r a b col secs acct rst
+  j=$(cat 2>/dev/null)
+  fh=$(jq -r '.rate_limits.five_hour.used_percentage // empty' <<<"$j" 2>/dev/null); fh=${fh%.*}
+  sd=$(jq -r '.rate_limits.seven_day.used_percentage // empty' <<<"$j" 2>/dev/null); sd=${sd%.*}
+  r=$(jq -r '.rate_limits.five_hour.resets_at // empty' <<<"$j" 2>/dev/null)
+  [[ -z $fh && -z $sd ]] && return
+  a=$((100-${fh:-0})); b=$((100-${sd:-0}))
+  rst=$'\033[0m'; col=$'\033[32m'; ((a<=30)) && col=$'\033[33m'; ((a<=10)) && col=$'\033[31m'
+  acct="${CLAUDIUS_ACCT:-}"
+  [[ -n $acct ]] && printf '\033[1m%s%s  ' "$acct" "$rst"
+  printf '%s5h %d%% left%s' "$col" "$a" "$rst"
+  if [[ $r =~ ^[0-9]+$ ]]; then secs=$((r - $(epoch_now))); ((secs<0)) && secs=0
+    printf ' \033[2m(%s)%s' "$(fmt_dur "$secs")" "$rst"; fi
+  printf ' \033[2m\xc2\xb7 7d %d%% left%s\n' "$b" "$rst"
+}
+
+# Menubar usage for SwiftBar/xbar: a ⚡<headroom>% badge plus per-account detail.
+mb_color() { local h=$1; if ((h<=10)); then echo "#e5534b"; elif ((h<=30)); then echo "#d29922"; else echo "#3fb950"; fi; }
+cmd_menubar() {
+  have jq || { echo "⚡ ?"; echo "---"; echo "jq not found"; return; }
+  local a j fh sd fr sr h5 h7 best=-1 plan pj
+  local -a body=()
+  while IFS= read -r a; do
+    j=$(usage_json "$a" 2>/dev/null)
+    if [[ -z $j ]] || ! jq -e . >/dev/null 2>&1 <<<"$j"; then
+      body+=("$a — unavailable | color=#888888"); continue
+    fi
+    fh=$(jq -r '.five_hour.utilization // empty' <<<"$j"); fh=${fh%.*}
+    sd=$(jq -r '.seven_day.utilization // empty' <<<"$j"); sd=${sd%.*}
+    fr=$(jq -r '.five_hour.resets_at // ""' <<<"$j")
+    sr=$(jq -r '.seven_day.resets_at // ""' <<<"$j")
+    [[ -z $fh && -z $sd ]] && { body+=("$a — auth error (token expired?) | color=#e5534b"); continue; }
+    h5=$((100-${fh:-0})); h7=$((100-${sd:-0})); ((h5>best)) && best=$h5
+    pj=$(profile_json "$a" 2>/dev/null); plan=""
+    if   jq -e '.account.has_claude_max==true' >/dev/null 2>&1 <<<"$pj"; then plan="Max"
+    elif jq -e '.account.has_claude_pro==true' >/dev/null 2>&1 <<<"$pj"; then plan="Pro"; fi
+    body+=("$a${plan:+ · $plan} | size=13")
+    body+=("--5h ${h5}% left${fr:+  · resets in $(rel_time "$fr")} | color=$(mb_color "$h5") size=12")
+    body+=("--7d ${h7}% left${sr:+  · resets in $(rel_time "$sr")} | color=$(mb_color "$h7") size=12")
+  done < <(accounts)
+  if ((best<0)); then echo "⚡ –"; else echo "⚡${best}% | color=$(mb_color "$best")"; fi
+  echo "---"
+  echo "Claude usage · 5h headroom | size=11 color=#888888"
+  printf '%s\n' "${body[@]}"
+  echo "---"
+  echo "Refresh | refresh=true"
+}
+
+usage_help() {
+  cat <<EOF
+claudius $VERSION — a launcher and session manager for Claude Code
+
+USAGE
+  claudius              launch the interactive UI
+  claudius clip [text]  save a prompt draft for the current project
+                        (no text opens \$EDITOR; in the UI press 'c')
+  claudius serve        serve the UI as a web terminal (phone / remote access)
+  claudius --help       show this help
+  claudius --version    print the version
+
+In the UI: arrow keys pick a chat, Enter opens it, and the command bar at the
+bottom lists the single-key actions (new, search, clipboard, accounts, …).
+
+CONFIG   ${CFG/#$HOME/~}
+ENV      CLAUDIUS_NOANIM=1    disable the intro animation
+         CLAUDIUS_SERVE_PORT  port for 'serve' (default 7681)
+EOF
+}
+
+check_deps() {
+  local miss=()
+  have claude || miss+=(claude)
+  have jq     || miss+=(jq)
+  if ((${#miss[@]})); then
+    printf 'claudius needs: %s\n' "${miss[*]}" >&2
+    [[ " ${miss[*]} " == *" claude "* ]] && printf '  install Claude Code: https://claude.com/code\n' >&2
+    [[ " ${miss[*]} " == *" jq "* ]]     && printf '  install jq:         brew install jq  /  apt install jq\n' >&2
+    return 1
+  fi
+}
+
+main() {
+  case "${1:-}" in
+    -h|--help|help)    usage_help ;;
+    -V|--version|version) printf 'claudius %s\n' "$VERSION" ;;
+    clip)              shift; cmd_clip "$@" ;;
+    clips)             shift; cmd_clips "$@" ;;
+    usage-line)        cmd_usage_line ;;               # for Claude Code's status line
+    menubar)           cmd_menubar ;;                  # for the SwiftBar menubar plugin
+    edit-input)        shift; cmd_edit_input "$@" ;;   # invoked by the Ctrl+G wrapper
+    serve)             check_deps && cmd_serve ;;
+    "")                check_deps && run_tui ;;
+    *)                 printf 'claudius: unknown argument "%s" (try --help)\n' "$1" >&2; return 1 ;;
+  esac
+}
+
+[[ ${BASH_SOURCE[0]} == "${0}" ]] && main "$@"
