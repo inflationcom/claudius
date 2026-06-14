@@ -1070,11 +1070,16 @@ exec "$self" menubar
 EOF
   chmod +x "$plugin"
   printf 'menubar plugin written: %s\n' "$plugin"
-  if [[ $OS == macos && ! -d /Applications/SwiftBar.app ]]; then
-    printf 'next: install SwiftBar, then set its plugin folder to %s\n' "$dir"
-    printf '      brew install --cask swiftbar\n'
+  if [[ $OS == macos ]]; then
+    if [[ -d /Applications/SwiftBar.app ]]; then
+      defaults write com.ameba.SwiftBar PluginDirectory "$dir" >/dev/null 2>&1 \
+        && printf 'pointed SwiftBar at %s\n' "$dir"
+      printf 'done — launch it:  open -a SwiftBar\n'
+    else
+      printf 'next: install SwiftBar, then run this again:\n      brew install --cask swiftbar\n'
+    fi
   else
-    printf 'next: set your menubar app'\''s plugin folder to %s (or hit refresh)\n' "$dir"
+    printf 'next: point your menubar app (Argos/xbar) at %s\n' "$dir"
   fi
 }
 
