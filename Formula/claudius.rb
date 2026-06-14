@@ -7,11 +7,11 @@
 #      `curl -sL <url> | shasum -a 256`), then copy this file into the tap repo
 #      as Formula/claudius.rb.
 #
-# Users then install with:  brew install OWNER/tap/claudius
+# Users then install with:  brew install inflationcom/tap/claudius
 class Claudius < Formula
   desc "Launcher and session manager for Claude Code"
-  homepage "https://github.com/OWNER/claudius"
-  url "https://github.com/OWNER/claudius/archive/refs/tags/v0.1.0.tar.gz"
+  homepage "https://github.com/inflationcom/claudius"
+  url "https://github.com/inflationcom/claudius/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "REPLACE_WITH_TARBALL_SHA256"
   license "MIT"
 

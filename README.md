@@ -35,19 +35,19 @@ chat and decide which account to run it with.
 **One-liner** (macOS / Linux):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/claudius/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/inflationcom/claudius/main/install.sh | bash
 ```
 
 **Homebrew** (macOS / Linux):
 
 ```sh
-brew install OWNER/tap/claudius
+brew install inflationcom/tap/claudius
 ```
 
 **From a clone:**
 
 ```sh
-git clone https://github.com/OWNER/claudius
+git clone https://github.com/inflationcom/claudius
 cd claudius
 ./install.sh
 ```

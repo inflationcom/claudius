@@ -3,13 +3,13 @@
 # Install claudius into your PATH (default: ~/.local/bin).
 #
 # Local clone:   ./install.sh
-# One-liner:     curl -fsSL https://raw.githubusercontent.com/OWNER/claudius/main/install.sh | bash
+# One-liner:     curl -fsSL https://raw.githubusercontent.com/inflationcom/claudius/main/install.sh | bash
 #
 # Override the target:   PREFIX=/usr/local/bin ./install.sh
 # Override the source:   CLAUDIUS_REPO=you/claudius  CLAUDIUS_BRANCH=main  ./install.sh
 set -euo pipefail
 
-REPO="${CLAUDIUS_REPO:-OWNER/claudius}"
+REPO="${CLAUDIUS_REPO:-inflationcom/claudius}"
 BRANCH="${CLAUDIUS_BRANCH:-main}"
 dest_dir="${PREFIX:-$HOME/.local/bin}"
 dest="$dest_dir/claudius"
