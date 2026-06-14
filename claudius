@@ -1054,17 +1054,42 @@ cmd_menubar() {
   echo "Refresh | refresh=true"
 }
 
+# One-command menubar setup: write a self-contained SwiftBar/xbar plugin that
+# calls this claudius. Works regardless of how claudius was installed.
+cmd_menubar_install() {
+  local dir="${1:-$HOME/.config/swiftbar}"
+  local plugin="$dir/claudius.5m.sh"
+  local self; self="$(command -v claudius || echo "$HOME/.local/bin/claudius")"
+  mkdir -p "$dir"
+  cat >"$plugin" <<EOF
+#!/bin/bash
+# <xbar.title>claudius usage</xbar.title>
+# <xbar.desc>Per-account Claude usage headroom (5h / 7d).</xbar.desc>
+export PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin:\$HOME/.local/bin:\$PATH"
+exec "$self" menubar
+EOF
+  chmod +x "$plugin"
+  printf 'menubar plugin written: %s\n' "$plugin"
+  if [[ $OS == macos && ! -d /Applications/SwiftBar.app ]]; then
+    printf 'next: install SwiftBar, then set its plugin folder to %s\n' "$dir"
+    printf '      brew install --cask swiftbar\n'
+  else
+    printf 'next: set your menubar app'\''s plugin folder to %s (or hit refresh)\n' "$dir"
+  fi
+}
+
 usage_help() {
   cat <<EOF
 claudius $VERSION — a launcher and session manager for Claude Code
 
 USAGE
-  claudius              launch the interactive UI
-  claudius clip [text]  save a prompt draft for the current project
-                        (no text opens \$EDITOR; in the UI press 'c')
-  claudius serve        serve the UI as a web terminal (phone / remote access)
-  claudius --help       show this help
-  claudius --version    print the version
+  claudius                 launch the interactive UI
+  claudius clip [text]     save a prompt draft for the current project
+                           (no text opens \$EDITOR; in the UI press 'c')
+  claudius menubar install set up the usage menubar widget (SwiftBar / xbar)
+  claudius serve           serve the UI as a web terminal (phone / remote access)
+  claudius --help          show this help
+  claudius --version       print the version
 
 In the UI: arrow keys pick a chat, Enter opens it, and the command bar at the
 bottom lists the single-key actions (new, search, clipboard, accounts, …).
@@ -1094,7 +1119,11 @@ main() {
     clip)              shift; cmd_clip "$@" ;;
     clips)             shift; cmd_clips "$@" ;;
     usage-line)        cmd_usage_line ;;               # for Claude Code's status line
-    menubar)           cmd_menubar ;;                  # for the SwiftBar menubar plugin
+    menubar)           shift
+                       case "${1:-}" in
+                         install) shift; cmd_menubar_install "$@" ;;  # one-command setup
+                         *)       cmd_menubar ;;                      # SwiftBar plugin output
+                       esac ;;
     edit-input)        shift; cmd_edit_input "$@" ;;   # invoked by the Ctrl+G wrapper
     serve)             check_deps && cmd_serve ;;
     "")                check_deps && run_tui ;;

@@ -99,23 +99,21 @@ full shell access, so keep it on a trusted network.
 
 ### Usage in your menubar
 
-`claudius menubar` prints [SwiftBar/xbar](https://github.com/swiftbar/SwiftBar)
-format — a `⚡<headroom>%` badge plus per-account 5h/7d detail. To keep it live in
-the menubar:
-
-**macOS** (SwiftBar):
+A `⚡<headroom>%` badge plus per-account 5h/7d detail, in your menubar. One command:
 
 ```sh
-brew install --cask swiftbar
-mkdir -p ~/.config/swiftbar
-ln -sf "$PWD/menubar/claudius.5m.sh" ~/.config/swiftbar/claudius.5m.sh
+claudius menubar install
 ```
 
-Launch SwiftBar and point its plugin folder at `~/.config/swiftbar`.
+That writes a plugin to `~/.config/swiftbar/`. Then:
 
-**Linux** (GNOME via [Argos](https://github.com/p-e-w/argos), or
-[xbar](https://github.com/matryer/xbar)): drop `menubar/claudius.5m.sh` into the
-plugin directory. The output format is identical.
+- **macOS:** `brew install --cask swiftbar`, launch it, point its plugin folder
+  at `~/.config/swiftbar`.
+- **Linux:** install [Argos](https://github.com/p-e-w/argos) (GNOME) or
+  [xbar](https://github.com/matryer/xbar) and pass its plugin dir:
+  `claudius menubar install ~/.config/argos`.
+
+(Under the hood it just runs `claudius menubar`, which prints SwiftBar/xbar format.)
 
 ## Configuration
 
